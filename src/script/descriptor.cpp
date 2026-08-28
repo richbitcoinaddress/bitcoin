@@ -27,11 +27,13 @@
 #include <uint256.h>
 #include <util/bip32.h>
 #include <util/check.h>
+#include <util/expected.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/vector.h>
 
 #include <algorithm>
+#include <compare>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -186,18 +188,6 @@ public:
 
     virtual ~PubkeyProvider() = default;
 
-    /** Compare two public keys represented by this provider.
-     * Used by the Miniscript descriptors to check for duplicate keys in the script.
-     */
-    bool operator<(PubkeyProvider& other) const {
-        FlatSigningProvider dummy;
-
-        std::optional<CPubKey> a = GetPubKey(0, dummy, dummy);
-        std::optional<CPubKey> b = other.GetPubKey(0, dummy, dummy);
-
-        return a < b;
-    }
-
     /** Derive a public key and put it into out.
      *  read_cache is the cache to read keys from (if not nullptr)
      *  write_cache is the cache to write keys to (if not nullptr)
@@ -234,6 +224,14 @@ public:
     /** Derive a private key, if private data is available in arg and put it into out. */
     virtual void GetPrivKey(int pos, const SigningProvider& arg, FlatSigningProvider& out) const = 0;
 
+    /** Whether private data for this provider is available in arg. */
+    virtual bool HavePrivateKeys(const SigningProvider& arg) const
+    {
+        FlatSigningProvider tmp_provider;
+        GetPrivKey(/*pos=*/0, arg, tmp_provider);
+        return !tmp_provider.keys.empty();
+    }
+
     /** Return the non-extended public key for this PubkeyProvider, if it has one. */
     virtual std::optional<CPubKey> GetRootPubKey() const = 0;
     /** Return the extended public key for this PubkeyProvider, if it has one. */
@@ -269,13 +267,21 @@ public:
     OriginPubkeyProvider(uint32_t exp_index, KeyOriginInfo info, std::unique_ptr<PubkeyProvider> provider, bool apostrophe) : PubkeyProvider(exp_index), m_origin(std::move(info)), m_provider(std::move(provider)), m_apostrophe(apostrophe) {}
     std::optional<CPubKey> GetPubKey(int pos, const SigningProvider& arg, FlatSigningProvider& out, const DescriptorCache* read_cache = nullptr, DescriptorCache* write_cache = nullptr) const override
     {
-        std::optional<CPubKey> pub = m_provider->GetPubKey(pos, arg, out, read_cache, write_cache);
+        // Derive into a temporary provider. Another key expression may have already put this
+        // key into out with its origin prefixed, and prefixing that entry would double it up.
+        FlatSigningProvider subprovider;
+        std::optional<CPubKey> pub = m_provider->GetPubKey(pos, arg, subprovider, read_cache, write_cache);
         if (!pub) return std::nullopt;
-        Assert(out.pubkeys.contains(pub->GetID()));
-        auto& [pubkey, suborigin] = out.origins[pub->GetID()];
+        const CKeyID keyid{pub->GetID()};
+        Assert(subprovider.pubkeys.contains(keyid));
+        auto& [pubkey, suborigin] = subprovider.origins[keyid];
         Assert(pubkey == *pub); // m_provider must have a valid origin by this point.
         suborigin.fingerprint = m_origin.fingerprint;
         suborigin.path.insert(suborigin.path.begin(), m_origin.path.begin(), m_origin.path.end());
+        auto origin{subprovider.origins.extract(keyid)};
+        out.Merge(std::move(subprovider));
+        // An explicit origin takes precedence over an implicit one for the same key.
+        out.origins.insert_or_assign(keyid, std::move(origin.mapped()));
         return pub;
     }
     bool IsRange() const override { return m_provider->IsRange(); }
@@ -432,10 +438,7 @@ class BIP32PubkeyProvider final : public PubkeyProvider
     bool IsHardened() const
     {
         if (m_derive == DeriveType::HARDENED_RANGED) return true;
-        for (auto entry : m_path) {
-            if (entry >> 31) return true;
-        }
-        return false;
+        return HasHardenedDerivation(m_path);
     }
 
 public:
@@ -449,7 +452,7 @@ public:
         info.fingerprint = m_root_extkey.id_key_fingerprint();
         info.path = m_path;
         if (m_derive == DeriveType::UNHARDENED_RANGED) info.path.push_back((uint32_t)pos);
-        if (m_derive == DeriveType::HARDENED_RANGED) info.path.push_back(((uint32_t)pos) | 0x80000000L);
+        if (m_derive == DeriveType::HARDENED_RANGED) info.path.push_back(((uint32_t)pos) | BIP32_HARDENED_FLAG);
 
         // Derive keys or fetch them from cache
         CExtPubKey final_extkey = m_root_extkey;
@@ -470,7 +473,7 @@ public:
             if (!GetDerivedExtKey(arg, xprv, lh_xprv)) return std::nullopt;
             parent_extkey = xprv.Neuter();
             if (m_derive == DeriveType::UNHARDENED_RANGED) der = xprv.Derive(xprv, pos);
-            if (m_derive == DeriveType::HARDENED_RANGED) der = xprv.Derive(xprv, pos | 0x80000000UL);
+            if (m_derive == DeriveType::HARDENED_RANGED) der = xprv.Derive(xprv, pos | BIP32_HARDENED_FLAG);
             final_extkey = xprv.Neuter();
             if (lh_xprv.key.IsValid()) {
                 last_hardened_extkey = lh_xprv.Neuter();
@@ -594,7 +597,7 @@ public:
         CExtKey dummy;
         if (!GetDerivedExtKey(arg, extkey, dummy)) return;
         if (m_derive == DeriveType::UNHARDENED_RANGED && !extkey.Derive(extkey, pos)) return;
-        if (m_derive == DeriveType::HARDENED_RANGED && !extkey.Derive(extkey, pos | 0x80000000UL)) return;
+        if (m_derive == DeriveType::HARDENED_RANGED && !extkey.Derive(extkey, pos | BIP32_HARDENED_FLAG)) return;
         out.keys.emplace(extkey.key.GetPubKey().GetID(), extkey.key);
     }
     std::optional<CPubKey> GetRootPubKey() const override
@@ -781,6 +784,11 @@ public:
         }
     }
 
+    bool HavePrivateKeys(const SigningProvider& arg) const override
+    {
+        return std::ranges::all_of(m_participants, [&](const auto& prov) { return prov->HavePrivateKeys(arg); });
+    }
+
     // Get RootPubKey and GetRootExtPubKey are used to return the single pubkey underlying the pubkey provider
     // to be presented to the user in gethdkeys. As this is a multisig construction, there is no single underlying
     // pubkey hence nothing should be returned.
@@ -887,11 +895,8 @@ public:
             if (!sub->HavePrivateKeys(arg)) return false;
         }
 
-        FlatSigningProvider tmp_provider;
         for (const auto& pubkey : m_pubkey_args) {
-            tmp_provider.keys.clear();
-            pubkey->GetPrivKey(0, arg, tmp_provider);
-            if (tmp_provider.keys.empty()) return false;
+            if (!pubkey->HavePrivateKeys(arg)) return false;
         }
 
         return true;
@@ -1810,30 +1815,6 @@ enum class ParseScriptContext {
     MUSIG,   //!< Inside musig() (implies P2TR, cannot have nested musig())
 };
 
-std::optional<uint32_t> ParseKeyPathNum(std::span<const char> elem, bool& apostrophe, std::string& error, bool& has_hardened)
-{
-    bool hardened = false;
-    if (elem.size() > 0) {
-        const char last = elem[elem.size() - 1];
-        if (last == '\'' || last == 'h') {
-            elem = elem.first(elem.size() - 1);
-            hardened = true;
-            apostrophe = last == '\'';
-        }
-    }
-    const auto p{ToIntegral<uint32_t>(std::string_view{elem.begin(), elem.end()})};
-    if (!p) {
-        error = strprintf("Key path value '%s' is not a valid uint32", std::string_view{elem.begin(), elem.end()});
-        return std::nullopt;
-    } else if (*p > 0x7FFFFFFFUL) {
-        error = strprintf("Key path value %u is out of range", *p);
-        return std::nullopt;
-    }
-    has_hardened = has_hardened || hardened;
-
-    return std::make_optional<uint32_t>(*p | (((uint32_t)hardened) << 31));
-}
-
 /**
  * Parse a key path, being passed a split list of elements (the first element is ignored because it is always the key).
  *
@@ -1847,6 +1828,19 @@ std::optional<uint32_t> ParseKeyPathNum(std::span<const char> elem, bool& apostr
  **/
 [[nodiscard]] bool ParseKeyPath(const std::vector<std::span<const char>>& split, std::vector<KeyPath>& out, bool& apostrophe, std::string& error, bool allow_multipath, bool& has_hardened)
 {
+    auto parse_elem = [&](std::span<const char> elem) -> std::optional<uint32_t> {
+        const auto parsed{ParseKeyPathElement(elem)};
+        if (!parsed) {
+            error = parsed.error();
+            return std::nullopt;
+        }
+        if (parsed->is_hardened) {
+            has_hardened = true;
+            apostrophe = elem.back() == '\'';
+        }
+        return parsed->ChildNumber();
+    };
+
     KeyPath path;
     struct MultipathSubstitutes {
         size_t placeholder_index;
@@ -1879,7 +1873,7 @@ std::optional<uint32_t> ParseKeyPathNum(std::span<const char> elem, bool& apostr
             substitutes.emplace();
             std::unordered_set<uint32_t> seen_substitutes;
             for (const auto& num : nums) {
-                const auto& op_num = ParseKeyPathNum(num, apostrophe, error, has_hardened);
+                const auto& op_num = parse_elem(num);
                 if (!op_num) return false;
                 auto [_, inserted] = seen_substitutes.insert(*op_num);
                 if (!inserted) {
@@ -1892,7 +1886,7 @@ std::optional<uint32_t> ParseKeyPathNum(std::span<const char> elem, bool& apostr
             path.emplace_back(); // Placeholder for multipath segment
             substitutes->placeholder_index = path.size() - 1;
         } else {
-            const auto& op_num = ParseKeyPathNum(elem, apostrophe, error, has_hardened);
+            const auto& op_num = parse_elem(elem);
             if (!op_num) return false;
             path.emplace_back(*op_num);
         }
@@ -2254,7 +2248,19 @@ struct KeyParser {
         : m_out(out), m_in(in), m_script_ctx(ctx), m_expr_index(key_exp_index) {}
 
     bool KeyCompare(const Key& a, const Key& b) const {
-        return *m_keys.at(a).at(0) < *m_keys.at(b).at(0);
+        // Deriving a hardened step needs the private key, so use the provider that was filled
+        // while parsing, or the one we are inferring from, rather than an empty one.
+        const SigningProvider& provider{m_out ? *m_out : (m_in ? *m_in : DUMMY_SIGNING_PROVIDER)};
+        const PubkeyProvider& key_a{*m_keys.at(a).at(0)};
+        const PubkeyProvider& key_b{*m_keys.at(b).at(0)};
+        FlatSigningProvider out_a, out_b;
+        const std::optional<CPubKey> pub_a{key_a.GetPubKey(0, provider, out_a)};
+        const std::optional<CPubKey> pub_b{key_b.GetPubKey(0, provider, out_b)};
+        if (pub_a && pub_b) return *pub_a < *pub_b;
+        // Keys that cannot be derived sort before the ones that can, and are compared by their
+        // expression so that two different keys are not taken for duplicates.
+        if (pub_a.has_value() != pub_b.has_value()) return !pub_a.has_value();
+        return key_a.ToString() < key_b.ToString();
     }
 
     ParseScriptContext ParseContext() const {

@@ -283,7 +283,7 @@ class ListTransactionsTest(BitcoinTestFramework):
         desc = descsum_create(f"tr({xpubs[0].to_string()}/*,pk({xprvs[1].to_string()}/*))")
         assert_equal(wallet.importdescriptors([{"desc": desc, "active": True, "timestamp": "now"}])[0]["success"], True)
         default_wallet.sendtoaddress(wallet.getnewaddress(address_type="bech32m"), 1)
-        self.generate(self.nodes[0], 1, sync_fun=self.no_op)
+        self.generate(self.nodes[0], 1)
         # Isolate node0 for later reorg coverage
         self.disconnect_nodes(0, 1)
         self.disconnect_nodes(0, 2)
@@ -355,6 +355,16 @@ class ListTransactionsTest(BitcoinTestFramework):
         self.nodes[0].syncwithvalidationinterfacequeue()
         assert_equal(wallet.gettransaction(txid)["confirmations"], 0)
         self.check_tx_variants(wallet, txid, key_path_tx, key_path_wtxid, alternate_wtxids=[script_path_wtxid])
+
+        # listsinceblock "removed" entries reflect the wallet's current CWalletTx, not a
+        # snapshot of the detached block. The detached block contained the heavier script
+        # path variant, but "wtxid" reports the current canonical (key path) variant and
+        # the script path variant appears under "alternate_wtxids". A future improvement
+        # could track which specific variant was in the detached block and report that.
+        removed = next(e for e in wallet.listsinceblock(block)["removed"] if e["txid"] == txid)
+        assert_equal(removed["confirmations"], 0)
+        assert_equal(removed["wtxid"], key_path_wtxid)
+        assert_equal(removed["alternate_wtxids"], [script_path_wtxid])
 
 
 if __name__ == '__main__':
